@@ -1,0 +1,162 @@
+﻿// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+// See the LICENSE file in the project root for more information.
+
+#nullable disable
+
+using System;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Serialization;
+using Microsoft.CodeAnalysis.Serialization;
+using Roslyn.Utilities;
+
+namespace Microsoft.CodeAnalysis
+{
+    /// <summary>
+    /// Checksum of data can be used later to see whether two data are same or not
+    /// without actually comparing data itself
+    /// </summary>
+    [DataContract]
+    internal sealed partial record class Checksum(
+        [property: DataMember(Order = 0)] Checksum.HashData Hash)
+    {
+        /// <summary>
+        /// The intended size of the <see cref="HashData"/> structure. 
+        /// </summary>
+        public const int HashSize = 16;
+
+        public static readonly Checksum Null = new(Hash: default);
+
+        /// <summary>
+        /// Create Checksum from given byte array. if byte array is bigger than <see cref="HashSize"/>, it will be
+        /// truncated to the size.
+        /// </summary>
+        public static Checksum From(byte[] checksum)
+            => From(checksum.AsSpan());
+
+        /// <summary>
+        /// Create Checksum from given byte array. if byte array is bigger than <see cref="HashSize"/>, it will be
+        /// truncated to the size.
+        /// </summary>
+        public static Checksum From(ImmutableArray<byte> checksum)
+            => From(checksum.AsSpan());
+
+        public static Checksum From(ReadOnlySpan<byte> checksum)
+        {
+            if (checksum.Length == 0)
+                return Null;
+
+            if (checksum.Length < HashSize)
+                throw new ArgumentException($"checksum must be equal or bigger than the hash size: {HashSize}", nameof(checksum));
+
+            Contract.ThrowIfFalse(MemoryMarshal.TryRead(checksum, out HashData hash));
+            return new Checksum(hash);
+        }
+
+        public string ToBase64String()
+        {
+#if NETCOREAPP
+            Span<byte> bytes = stackalloc byte[HashSize];
+            this.WriteTo(bytes);
+            return Convert.ToBase64String(bytes);
+#else
+            unsafe
+            {
+                var data = new byte[HashSize];
+                fixed (byte* dataPtr = data)
+                {
+                    *(HashData*)dataPtr = Hash;
+                }
+
+                return Convert.ToBase64String(data, 0, HashSize);
+            }
+#endif
+        }
+
+        public static Checksum FromBase64String(string value)
+            => value == null ? null : From(Convert.FromBase64String(value));
+
+        public override string ToString()
+            => ToBase64String();
+
+        public void WriteTo(ObjectWriter writer)
+            => Hash.WriteTo(writer);
+
+        public void WriteTo(Span<byte> span)
+        {
+            Hash.WriteTo(span);
+        }
+
+        public static Checksum ReadFrom(ObjectReader reader)
+            => new(HashData.ReadFrom(reader));
+
+        public static Func<Checksum, string> GetChecksumLogInfo { get; }
+            = checksum => checksum.ToString();
+
+        public static Func<IEnumerable<Checksum>, string> GetChecksumsLogInfo { get; }
+            = checksums => string.Join("|", checksums.Select(c => c.ToString()));
+
+        public static Func<ProjectStateChecksums, string> GetProjectChecksumsLogInfo { get; }
+            = checksums => checksums.Checksum.ToString();
+
+        // Explicitly implement this method as default jit for records on netfx doesn't properly devirtualize the
+        // standard calls to EqualityComparer<HashData>.Default.Equals
+        public bool Equals(Checksum other)
+            => other != null && Hash.Equals(other.Hash);
+
+        // Directly call into Hash to avoid any overhead that records add when hashing things like the EqualityContract
+        public override int GetHashCode()
+            => Hash.GetHashCode();
+
+        /// <summary>
+        /// This structure stores the 20-byte hash as an inline value rather than requiring the use of
+        /// <c>byte[]</c>.
+        /// </summary>
+        [DataContract, StructLayout(LayoutKind.Explicit, Size = HashSize)]
+        public readonly record struct HashData(
+            [field: FieldOffset(0)][property: DataMember(Order = 0)] long Data1,
+            [field: FieldOffset(8)][property: DataMember(Order = 1)] long Data2)
+        {
+            public void WriteTo(ObjectWriter writer)
+            {
+                writer.WriteInt64(Data1);
+                writer.WriteInt64(Data2);
+            }
+
+            public void WriteTo(Span<byte> span)
+            {
+                Contract.ThrowIfTrue(span.Length < HashSize);
+#pragma warning disable CS9191 // The 'ref' modifier for an argument corresponding to 'in' parameter is equivalent to 'in'. Consider using 'in' instead.
+                Contract.ThrowIfFalse(MemoryMarshal.TryWrite(span, ref Unsafe.AsRef(in this)));
+#pragma warning restore CS9191
+            }
+
+            public static HashData ReadFrom(ObjectReader reader)
+                => new(reader.ReadInt64(), reader.ReadInt64());
+
+            public override int GetHashCode()
+            {
+                // The checksum is already a hash. Just read a 4-byte value to get a well-distributed hash code.
+                return (int)Data1;
+            }
+
+            // Explicitly implement this method as default jit for records on netfx doesn't properly devirtualize the
+            // standard calls to EqualityComparer<long>.Default.Equals
+            public bool Equals(HashData other)
+                => this.Data1 == other.Data1 && this.Data2 == other.Data2;
+        }
+    }
+
+    internal static class ChecksumExtensions
+    {
+        public static void AddIfNotNullChecksum(this HashSet<Checksum> checksums, Checksum checksum)
+        {
+            if (checksum != Checksum.Null)
+                checksums.Add(checksum);
+        }
+    }
+}
